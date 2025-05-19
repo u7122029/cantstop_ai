@@ -56,13 +56,13 @@ def main():
         state: CantStopState = x[0]
 
         #state = one_hot_encode(state_size, state)
-        encoded_state = torch.from_numpy(np.concat([state.saved_steps_remaining, state.active_steps_remaining]))
+        #encoded_state = torch.from_numpy(np.concat([state.saved_steps_remaining, state.active_steps_remaining]))
 
         score = 0
         success = False
 
         for t in range(maximum_number_timesteps_per_episode):
-            action = action_choices[agent.act(encoded_state, epsilon)]
+            action = action_choices[agent.act(state, epsilon)]
             action_id = action.value
 
             next_state, reward, done, _, _ = env.step(action)
@@ -74,12 +74,10 @@ def main():
             if isinstance(next_state.current_action, ProgressActionSet):
                 dice_action = random.choice(list(next_state.current_action))
                 next_state, reward, _, _, _ = env.step(dice_action)
-            encoded_next_state = torch.from_numpy(np.concat([next_state.saved_steps_remaining,
-                                                             next_state.active_steps_remaining]))
 
-            agent.step(encoded_state, action_id, reward, encoded_next_state, done, minibatch_size, discount_factor,
+            agent.step(state, action_id, reward, next_state, done, minibatch_size, discount_factor,
                        interpolation_parameter)
-            encoded_next_state.copy_(encoded_state)
+            state = next_state.copy()
 
         scores_on_100_episodes.append(score)
 

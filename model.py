@@ -7,7 +7,7 @@ import numpy as np
 from collections import deque
 import random
 
-from cantstop_env.envs.cant_stop_utils import CantStopState
+from cantstop_env.envs.cant_stop_utils import CantStopState, CantStopActionType, StopContinueChoice, ProgressActionSet
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -35,7 +35,7 @@ class StopContinueModel1(nn.Module):
 
 class SelectDiceModel1(nn.Module):
     def __init__(self, hidden_size=55):
-        super.__init__()
+        super().__init__()
         self.l1 = nn.Linear(11 + 11 + 77, hidden_size)
         self.l2 = nn.Linear(hidden_size, hidden_size // 2)
         self.l3 = nn.Linear(hidden_size // 4, 77)
@@ -89,45 +89,67 @@ class Agent:
         self.local_stop_continue_qnetwork = StopContinueModel1(state_size).to(DEVICE)
         self.target_stop_continue_qnetwork = StopContinueModel1(state_size).to(DEVICE)
 
+        self.local_select_dice_qnetwork = SelectDiceModel1().to(DEVICE)
+        self.target_stop_continue_qnetwork = SelectDiceModel1().to(DEVICE)
+
         self.optimiser = optim.Adam(self.local_stop_continue_qnetwork.parameters(), lr=learning_rate)
         self.memory = ReplayMemory(replay_buffer_size)
         self.t_step = 0
 
     def step(self,
-             state,
+             state: CantStopState,
              action,
              reward,
-             next_state,
+             next_state: CantStopState,
              done,
              minibatch_size,
              discount_factor,
              interpolation_parameter):
-        self.memory.push((state, action, reward, next_state, done))
+        self.memory.push((state.to_np_embedding(),
+                          action,
+                          reward,
+                          next_state.to_np_embedding(),
+                          done))
         self.t_step = (self.t_step + 1) % 4
 
         if self.t_step == 0 and len(self.memory.memory) > minibatch_size:
             experiences = self.memory.sample(100)
             self.learn(experiences, discount_factor, interpolation_parameter)
 
-    def act(self, state: torch.tensor, epsilon):
+    def act(self, state: CantStopState, epsilon):
         """
         Chooses an action to take, given a state.
         :param state:
         :param epsilon:
         :return:
         """
-        state = state.float().unsqueeze(0).to(DEVICE)
+        #state = state.float().unsqueeze(0).to(DEVICE)
+        inp_state = torch.from_numpy(state.to_np_embedding()).float().unsqueeze(0).to(DEVICE)
+        if isinstance(state.current_action, StopContinueChoice):
+            # get action the agent would take, without updating weights.
+            self.local_stop_continue_qnetwork.eval()
+            with torch.no_grad():
+                action_values = self.local_stop_continue_qnetwork(inp_state)
+            self.local_stop_continue_qnetwork.train()
 
-        # get action the agent would take, without updating weights.
-        self.local_stop_continue_qnetwork.eval()
-        with torch.no_grad():
-            action_values = self.local_stop_continue_qnetwork(state)
-        self.local_stop_continue_qnetwork.train()
+            if np.random.sample() > epsilon:
+                return np.argmax(action_values.cpu().data.numpy())
+            else:
+                return np.random.choice(np.arange(inp_state.shape[1]))
+        elif isinstance(state.current_action, ProgressActionSet):
+            self.local_select_dice_qnetwork.eval()
+            with torch.no_grad():
+                action_values = self.local_select_dice_qnetwork(inp_state)
+            self.local_select_dice_qnetwork.train()
+        else:
+            raise ValueError(f"The state's current action ({state.current_action}) is not valid.")
 
         if np.random.sample() > epsilon:
+            # Choose the action with the highest q value
             return np.argmax(action_values.cpu().data.numpy())
-        else:
-            return np.random.choice(np.arange(self.action_size))
+        # Choose a random action.
+        return np.random.choice(np.arange(inp_state.shape[1]))
+
 
     def learn(self, experiences, discount_factor, interpolation_parameter):
         states, next_states, actions, rewards, dones = experiences
@@ -135,10 +157,6 @@ class Agent:
 
         q_targets = rewards + discount_factor * next_q_targets * (1 - dones)
         q_expected = F.sigmoid(self.local_stop_continue_qnetwork(states))#.gather(1, actions)
-        #print(next_q_targets.shape)
-        #print(q_expected.shape)
-        #print(q_targets.shape)
-        #quit()
         loss = F.mse_loss(q_expected, q_targets)
 
         self.optimiser.zero_grad()
