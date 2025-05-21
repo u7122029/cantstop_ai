@@ -1,17 +1,14 @@
-import random
-
-import torch
-
-import cantstop_env
-import gymnasium as gym
-import torch as T
-
-from cantstop_env.envs import CantStopEnv
-from cantstop_env.envs.cant_stop_utils import CantStopState, StopContinueAction, ProgressActionSet
-from model import Agent
-import numpy as np
 from collections import deque
+
+import gymnasium as gym
+import numpy as np
+import torch as T
 from tqdm import tqdm
+
+from cantstop_env.envs.cant_stop_utils import CantStopState, StopContinueAction, StopContinueChoice, \
+    ProgressActionChoice
+from model import Agent
+
 
 def one_hot_encode(size, idx):
     out = T.zeros(size)
@@ -55,15 +52,16 @@ def main():
         x = env.reset()
         state: CantStopState = x[0]
 
-        #state = one_hot_encode(state_size, state)
-        #encoded_state = torch.from_numpy(np.concat([state.saved_steps_remaining, state.active_steps_remaining]))
-
         score = 0
         success = False
 
         for t in range(maximum_number_timesteps_per_episode):
-            action = action_choices[agent.act(state, epsilon)]
-            action_id = action.value
+            if isinstance(state.current_action, StopContinueChoice):
+                action = agent.select_stop_continue_action(state, epsilon)
+            elif isinstance(state.current_action, ProgressActionChoice):
+                action = agent.select_dice_action(state, epsilon)
+            else:
+                raise Exception("invalid")
 
             next_state, reward, done, _, _ = env.step(action)
 
@@ -71,11 +69,13 @@ def main():
             if done:
                 break
 
-            if isinstance(next_state.current_action, ProgressActionSet):
-                dice_action = random.choice(list(next_state.current_action))
-                next_state, reward, _, _, _ = env.step(dice_action)
-
-            agent.step(state, action_id, reward, next_state, done, minibatch_size, discount_factor,
+            agent.step(state,
+                       action,
+                       reward,
+                       next_state,
+                       done,
+                       minibatch_size,
+                       discount_factor,
                        interpolation_parameter)
             state = next_state.copy()
 

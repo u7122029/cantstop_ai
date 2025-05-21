@@ -7,7 +7,8 @@ import numpy as np
 from collections import deque
 import random
 
-from cantstop_env.envs.cant_stop_utils import CantStopState, CantStopActionType, StopContinueChoice, ProgressActionSet
+from cantstop_env.envs.cant_stop_utils import CantStopState, CantStopActionChoice, StopContinueChoice, ProgressActionChoice, \
+    CantStopAction, ProgressAction, StopContinueAction
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -34,11 +35,11 @@ class StopContinueModel1(nn.Module):
         return F.sigmoid(x)
 
 class SelectDiceModel1(nn.Module):
-    def __init__(self, hidden_size=55):
+    def __init__(self, hidden_size=88):
         super().__init__()
         self.l1 = nn.Linear(11 + 11 + 77, hidden_size)
-        self.l2 = nn.Linear(hidden_size, hidden_size // 2)
-        self.l3 = nn.Linear(hidden_size // 4, 77)
+        self.l2 = nn.Linear(hidden_size, 80)
+        self.l3 = nn.Linear(80, 77)
 
     def forward(self, x):
         x = self.l1(x)
@@ -90,68 +91,76 @@ class Agent:
         self.target_stop_continue_qnetwork = StopContinueModel1(state_size).to(DEVICE)
 
         self.local_select_dice_qnetwork = SelectDiceModel1().to(DEVICE)
-        self.target_stop_continue_qnetwork = SelectDiceModel1().to(DEVICE)
+        self.target_select_dice_qnetwork = SelectDiceModel1().to(DEVICE)
 
-        self.optimiser = optim.Adam(self.local_stop_continue_qnetwork.parameters(), lr=learning_rate)
-        self.memory = ReplayMemory(replay_buffer_size)
+        self.stop_continue_optimiser = optim.Adam(self.local_stop_continue_qnetwork.parameters(), lr=learning_rate)
+        self.select_dice_optimiser = optim.Adam(self.local_select_dice_qnetwork.parameters(), lr=learning_rate)
+
+        self.stop_continue_memory = ReplayMemory(replay_buffer_size)
+        self.select_dice_memory = ReplayMemory(replay_buffer_size)
+
         self.t_step = 0
 
     def step(self,
              state: CantStopState,
-             action,
+             action: CantStopAction,
              reward,
              next_state: CantStopState,
              done,
              minibatch_size,
              discount_factor,
              interpolation_parameter):
-        self.memory.push((state.to_np_embedding(),
-                          action,
-                          reward,
-                          next_state.to_np_embedding(),
-                          done))
+        self.stop_continue_memory.push((state.to_np_embedding(),
+                                        action,
+                                        reward,
+                                        next_state.to_np_embedding(),
+                                        done))
         self.t_step = (self.t_step + 1) % 4
 
-        if self.t_step == 0 and len(self.memory.memory) > minibatch_size:
-            experiences = self.memory.sample(100)
-            self.learn(experiences, discount_factor, interpolation_parameter)
+        if self.t_step != 0:
+            return
 
-    def act(self, state: CantStopState, epsilon):
-        """
-        Chooses an action to take, given a state.
-        :param state:
-        :param epsilon:
-        :return:
-        """
-        #state = state.float().unsqueeze(0).to(DEVICE)
+        if len(self.stop_continue_memory.memory) > minibatch_size:
+            experiences = self.stop_continue_memory.sample(minibatch_size)
+            self.learn_stop_continue(experiences, discount_factor, interpolation_parameter)
+
+        if len(self.select_dice_memory.memory) > minibatch_size:
+            experiences = self.select_dice_memory.sample(minibatch_size)
+            self.learn_select_dice(experiences, discount_factor, interpolation_parameter)
+
+    def select_stop_continue_action(self, state, epsilon):
         inp_state = torch.from_numpy(state.to_np_embedding()).float().unsqueeze(0).to(DEVICE)
-        if isinstance(state.current_action, StopContinueChoice):
-            # get action the agent would take, without updating weights.
-            self.local_stop_continue_qnetwork.eval()
-            with torch.no_grad():
-                action_values = self.local_stop_continue_qnetwork(inp_state)
-            self.local_stop_continue_qnetwork.train()
 
-            if np.random.sample() > epsilon:
-                return np.argmax(action_values.cpu().data.numpy())
-            else:
-                return np.random.choice(np.arange(inp_state.shape[1]))
-        elif isinstance(state.current_action, ProgressActionSet):
-            self.local_select_dice_qnetwork.eval()
-            with torch.no_grad():
-                action_values = self.local_select_dice_qnetwork(inp_state)
-            self.local_select_dice_qnetwork.train()
-        else:
-            raise ValueError(f"The state's current action ({state.current_action}) is not valid.")
+        self.local_stop_continue_qnetwork.eval()
+        with torch.no_grad():
+            action_values = self.local_stop_continue_qnetwork(inp_state)
+        self.local_stop_continue_qnetwork.train()
 
         if np.random.sample() > epsilon:
+            action_id = np.argmax(action_values.cpu().data.numpy())
+        else:
+            print(inp_state.shape)
+            action_id = np.random.choice(2)
+        return [StopContinueAction.STOP, StopContinueAction.CONTINUE][action_id]
+
+    def select_dice_action(self, state, epsilon):
+        inp_state = torch.from_numpy(state.to_np_embedding()).float().unsqueeze(0).to(DEVICE)
+
+        self.local_select_dice_qnetwork.eval()
+        with torch.no_grad():
+            action_values = self.local_select_dice_qnetwork(inp_state)
+        self.local_select_dice_qnetwork.train()
+
+        # TODO: implement mask to only allow valid actions to be outputted.
+        if np.random.sample() > epsilon:
             # Choose the action with the highest q value
-            return np.argmax(action_values.cpu().data.numpy())
-        # Choose a random action.
-        return np.random.choice(np.arange(inp_state.shape[1]))
+            action_id = np.argmax(action_values.cpu().data.numpy())
+        else:
+            # Choose a random action.
+            action_id = np.random.choice(77)
+        return ProgressAction.decode(action_id)
 
-
-    def learn(self, experiences, discount_factor, interpolation_parameter):
+    def learn_stop_continue(self, experiences, discount_factor, interpolation_parameter):
         states, next_states, actions, rewards, dones = experiences
         next_q_targets = self.target_stop_continue_qnetwork(next_states).detach()#.max(1)[0].unsqueeze(1)
 
@@ -159,13 +168,33 @@ class Agent:
         q_expected = F.sigmoid(self.local_stop_continue_qnetwork(states))#.gather(1, actions)
         loss = F.mse_loss(q_expected, q_targets)
 
-        self.optimiser.zero_grad()
+        self.stop_continue_optimiser.zero_grad()
         loss.backward()
-        self.optimiser.step()
-        self.soft_update(interpolation_parameter)
+        self.stop_continue_optimiser.step()
+        self.stop_continue_soft_update(interpolation_parameter)
 
-    def soft_update(self, interpolation_parameter):
+    def learn_select_dice(self, experiences, discount_factor, interpolation_parameter):
+        states, next_states, actions, rewards, dones = experiences
+        next_q_targets = self.target_select_dice_qnetwork(next_states).detach().max(1)[0].unsqueeze(1)
+
+        q_targets = rewards + discount_factor * next_q_targets * (1 - dones)
+        q_expected = F.sigmoid(self.local_select_dice_qnetwork(states))#.gather(1, actions)
+        loss = F.mse_loss(q_expected, q_targets)
+
+
+        self.select_dice_optimiser.zero_grad()
+        loss.backward()
+        self.select_dice_optimiser.step()
+        self.select_dice_soft_update(interpolation_parameter)
+
+    def stop_continue_soft_update(self, interpolation_parameter):
         for target_param, local_param in zip(self.target_stop_continue_qnetwork.parameters(),
                                              self.local_stop_continue_qnetwork.parameters()):
+            target_param.data.copy_(interpolation_parameter * local_param.data +
+                                    (1 - interpolation_parameter) * target_param.data)
+
+    def select_dice_soft_update(self, interpolation_parameter):
+        for target_param, local_param in zip(self.target_select_dice_qnetwork.parameters(),
+                                             self.local_select_dice_qnetwork.parameters()):
             target_param.data.copy_(interpolation_parameter * local_param.data +
                                     (1 - interpolation_parameter) * target_param.data)
