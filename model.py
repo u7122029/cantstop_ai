@@ -63,15 +63,9 @@ class ReplayMemory:
         experiences = random.sample(self.memory, k=batch_size)
         # Transpose list of lists
         states, actions, rewards, next_states, dones = zip(*experiences)
-
         states = torch.from_numpy(np.array(states)).float().to(self.device)
         #print(actions)
-        try:
-            actions = torch.from_numpy(np.array(actions)).long().unsqueeze(1).to(self.device)
-        except:
-            print("actions", actions)
-            print("error")
-            quit()
+        actions = torch.from_numpy(np.array(actions)).long().unsqueeze(1).to(self.device)
         rewards = torch.from_numpy(np.array(rewards)).float().unsqueeze(1).to(self.device)
         next_states = torch.from_numpy(np.array(next_states)).float().to(self.device)
         dones = torch.from_numpy(np.array(dones).astype(np.uint8)).float().unsqueeze(1).to(self.device)
@@ -110,11 +104,22 @@ class Agent:
              minibatch_size,
              discount_factor,
              interpolation_parameter):
-        self.stop_continue_memory.push((state.to_np_embedding(),
-                                        action,
-                                        reward,
-                                        next_state.to_np_embedding(),
-                                        done))
+        # TODO: Consider whether next state is different in kind to the previous one.
+        # e.g: stop_continue to dice_selection and vice versa
+        if isinstance(state.current_action, StopContinueChoice):
+            self.stop_continue_memory.push((state.to_np_embedding(),
+                                            action.encode(),
+                                            reward,
+                                            next_state.to_np_embedding(),
+                                            done))
+        elif isinstance(state.current_action, ProgressActionChoice):
+            self.select_dice_memory.push((state.to_np_embedding(),
+                                          action,
+                                          reward,
+                                          next_state.to_np_embedding(),
+                                          done))
+        else:
+            raise Exception()
         self.t_step = (self.t_step + 1) % 4
 
         if self.t_step != 0:
@@ -139,26 +144,32 @@ class Agent:
         if np.random.sample() > epsilon:
             action_id = np.argmax(action_values.cpu().data.numpy())
         else:
-            print(inp_state.shape)
+            #print(inp_state.shape)
             action_id = np.random.choice(2)
-        return [StopContinueAction.STOP, StopContinueAction.CONTINUE][action_id]
+        return StopContinueAction.decode(action_id)
 
-    def select_dice_action(self, state, epsilon):
+    def select_dice_action(self, state: CantStopState, epsilon):
+        assert isinstance(state.current_action, ProgressActionChoice)
         inp_state = torch.from_numpy(state.to_np_embedding()).float().unsqueeze(0).to(DEVICE)
 
         self.local_select_dice_qnetwork.eval()
         with torch.no_grad():
-            action_values = self.local_select_dice_qnetwork(inp_state)
+            action_values = self.local_select_dice_qnetwork(inp_state).cpu().squeeze()
         self.local_select_dice_qnetwork.train()
 
-        # TODO: implement mask to only allow valid actions to be outputted.
+        mask = state.current_action.as_encoded().astype(bool)
+        action_values[~mask] = -torch.inf
+        action_values = torch.softmax(action_values, dim=0)
+
         if np.random.sample() > epsilon:
             # Choose the action with the highest q value
-            action_id = np.argmax(action_values.cpu().data.numpy())
+            action_id = np.argmax(torch.softmax(action_values, dim=0).numpy())
         else:
             # Choose a random action.
-            action_id = np.random.choice(77)
-        return ProgressAction.decode(action_id)
+            action_id = random.choice(list(state.current_action.choices)).encode()
+
+        out = ProgressAction.decode(action_id)
+        return out
 
     def learn_stop_continue(self, experiences, discount_factor, interpolation_parameter):
         states, next_states, actions, rewards, dones = experiences
